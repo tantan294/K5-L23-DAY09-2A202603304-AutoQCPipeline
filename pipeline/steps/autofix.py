@@ -34,6 +34,96 @@ import yaml  # noqa: F401
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
+DROP_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_CODES = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}          # + mọi code bắt đầu bằng DUP_IMAGE_
+
+
+def _is_remove(code):
+    return code in REMOVE_CODES or code.startswith("DUP_IMAGE_")
+
+
+def _fmt(v):
+    return f"{v:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def _clip(text):
+    """Cắt box về [0,1]. Trả về dòng mới, hoặc None nếu box không còn diện tích (nằm hẳn ngoài ảnh)."""
+    cid, x, y, w, h = parse_yolo_line(text)
+    x1, x2 = max(0.0, x - w / 2), min(1.0, x + w / 2)
+    y1, y2 = max(0.0, y - h / 2), min(1.0, y + h / 2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return " ".join([str(cid), _fmt((x1 + x2) / 2), _fmt((y1 + y2) / 2), _fmt(x2 - x1), _fmt(y2 - y1)])
+
+
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    errors = [i for i in issues if i.severity == ERROR]     # không bao giờ động tới WARN
+    fixes = []
+
+    def log(image, line, action, before, after):
+        fixes.append({"image": image, "line": line, "action": action, "before": before, "after": after})
+
+    # 1) Xoá ảnh (trùng / rò rỉ test / hỏng / sai cỡ) — làm TRƯỚC để các issue dòng của ảnh đó bị bỏ qua êm.
+    removed = set()
+    for i in errors:
+        if _is_remove(i.code) and i.image not in removed:
+            removed.add(i.image)
+            img_paths = [p for p in ds.image_files() if p.stem == i.image]
+            lab = ds.label_path(i.image)
+            if not img_paths and not lab.exists():
+                continue                                       # đã xoá ở lần chạy trước -> không ghi gì (idempotent)
+            for p in img_paths:
+                p.unlink()
+            if lab.exists():
+                lab.unlink()
+            log(i.image, None, "remove_image", ", ".join(p.name for p in img_paths) or "(chỉ có nhãn)", f"đã xoá ({i.code})")
+
+    # 2) data.yaml: ghi lại names đúng cfg["classes"], giữ các khoá khác.
+    if any(i.code == "BAD_CLASS_NAME" for i in errors):
+        d = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) if ds.yaml_path.exists() else {}
+        d = d or {}
+        before = d.get("names")
+        new_names = {k: v for k, v in enumerate(cfg["classes"])}
+        if before != new_names:
+            d["names"] = new_names
+            ds.yaml_path.write_text(yaml.safe_dump(d, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            log("data.yaml", None, "rename_classes", str(before), str(new_names))
+
+    # 3) Ảnh chưa có nhãn: KHÔNG tạo file (rỗng = "ảnh nền"), chỉ ghi lại để chuyển người gán.
+    for stem in sorted({i.image for i in errors if i.code == "MISSING_LABEL_FILE"} - removed):
+        log(stem, None, "needs_label", "(không có file)", "chuyển người gán")
+
+    # 4) Lỗi dòng: gom theo file, dùng số dòng GỐC, ghi lại MỘT lần. Xoá dòng thắng cắt box.
+    drop, clip = defaultdict(set), defaultdict(set)
+    for i in errors:
+        if i.line is None or i.image in removed:
+            continue
+        if i.code in DROP_CODES:
+            drop[i.image].add(i.line)
+        elif i.code == "BOX_OUT_OF_IMAGE":
+            clip[i.image].add(i.line)
+
+    for stem in sorted(set(drop) | set(clip)):
+        path = ds.label_path(stem)
+        if not path.exists():
+            continue
+        raw = path.read_text(encoding="utf-8", errors="replace").splitlines()   # giữ cả dòng trống => số dòng gốc
+        out = []
+        for n, text in enumerate(raw, 1):
+            if n in drop[stem]:
+                log(stem, n, "drop_line", text, "")
+                continue
+            if n in clip[stem]:
+                try:
+                    new = _clip(text)
+                except ValueError:
+                    new = None
+                if new is None:
+                    log(stem, n, "drop_line", text, "")       # box nằm hẳn ngoài ảnh -> xoá thay vì ghi box rỗng
+                    continue
+                log(stem, n, "clip_box", text, new)
+                out.append(new)
+                continue
+            out.append(text)
+        path.write_text("".join(l + "\n" for l in out), encoding="utf-8")
+    return fixes
