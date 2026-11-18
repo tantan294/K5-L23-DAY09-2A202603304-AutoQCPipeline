@@ -57,7 +57,26 @@ kết luận **`REWORK — còn 6 lỗi bắt buộc (MISSING_LABEL_FILE): phả
 - `img_0030` dòng 9: khung tràn ra ngoài mép ảnh và không ôm vật nào → bắt được (`BOX_OUT_OF_IMAGE` 0.023, `POSSIBLE_FALSE_POS` dòng 9).
 
 ## 5. Train: raw vs clean (tùy chọn, chấm riêng)
-**Chưa chạy.** Ưu tiên hoàn thành và kiểm phần lõi (`check_submission.py --no-train`) trước; sẽ train trên Colab (yolo26n, 20 epoch, 2 seed) sau và cập nhật mục này nếu kịp.
+Cấu hình (Colab T4, `scripts/train_compare.py`): `yolo26n.pt`, 20 epoch, imgsz 640, seed 0 và 1; cùng val (`gold_val`, 40 ảnh) và cùng test (`data/test`, 100 ảnh nhãn người). Chỉ khác dữ liệu train: `raw` = 224 ảnh nhãn gốc, `clean` = 202 ảnh của `export/clean_v1` (bản nháp Hold).
+
+| biến thể | #ảnh train | số seed | map50 (TB ± độ lệch) | map50_95 (TB ± độ lệch) | precision (TB ± độ lệch) | recall (TB ± độ lệch) |
+|---|---|---|---|---|---|---|
+| raw | 224 | 2 | 0.726 ± 0.000 | 0.512 ± 0.004 | 0.764 ± 0.061 | 0.649 ± 0.028 |
+| clean | 202 | 2 | 0.701 ± 0.025 | 0.487 ± 0.008 | 0.759 ± 0.003 | 0.625 ± 0.019 |
+
+Chênh mAP50 (clean − raw) = **−0.025**. Theo từng seed: seed 0 là 0.718 vs 0.726 (−0.008), seed 1 là 0.683 vs 0.726 (−0.043).
+
+**So với nhiễu:** chênh −0.025 bằng đúng độ lệch giữa 2 seed của `clean` (±0.025); seed 0 gần như hoà, seed 1 thua rõ. Với chỉ 2 seed, độ lệch chuẩn ước lượng rất không chắc (`raw` ±0.000 chỉ là trùng hợp của 2 lần chạy). → **Chưa kết luận được** clean tốt hơn hay kém hơn raw; số liệu **không** ủng hộ "dữ liệu sạch giúp model tốt hơn" ở quy mô này.
+
+**AP50 theo lớp** (seed 0 / seed 1): car raw 0.751/0.724 – clean 0.740/0.736 (hoà); person 0.813/0.832 – 0.816/0.830 (hoà); **truck** 0.657/0.639 – **0.590/0.486** (clean kém nhất, dao động lớn); bus 0.681/0.709 – 0.726/0.681 (hoà). Phần chênh chủ yếu đến từ **truck**, lớp ít box nhất (41 box trong `class_stats.csv`).
+
+**Giả thuyết và cách kiểm:**
+1. **Ít dữ liệu hơn:** `clean` có ít hơn 22 ảnh (−10%); với 20 epoch và yolo26n, mất 10% ảnh có thể nặng hơn lợi ích từ nhãn sạch. *Kiểm:* train `raw` trên đúng 202 ảnh của manifest nhưng giữ nhãn gốc, để tách tác dụng "bớt ảnh" khỏi tác dụng "sửa nhãn".
+2. **Rò rỉ test thổi phồng `raw`:** `raw` còn 5 ảnh `LEAK_TEST` trùng ảnh trong `data/test` (`01_intake.csv`), model raw đã "thấy" một phần đề thi. *Kiểm:* đánh giá lại cả hai model trên test sau khi bỏ 5 ảnh test bị trùng; nếu khoảng cách thu hẹp thì điểm raw bị thổi phồng.
+3. **Nhãn `clean` chưa sạch hết, nhất là truck:** bản xuất là Hold, 38 ảnh còn cảnh báo chưa duyệt (20 `LOOSE_BOX`, 3 `WRONG_CLASS` trong `07_error_list_v3`); `drop_line` xoá 20 dòng có thể đã xoá cả box truck/bus đúng mà bị nhầm id. *Kiểm:* đếm box truck trong `work/train/raw` vs `work/train/clean` (ô 5 notebook) và xem `03_fixes.csv` các dòng bị xoá thuộc lớp nào.
+4. **Test nhỏ:** 100 ảnh, truck/bus có rất ít vật, một vài box thay đổi làm AP lớp đó nhảy 0.05–0.1. *Kiểm:* thêm seed (≥ 5) và báo khoảng tin cậy.
+
+**Việc tiếp theo:** chạy ≥ 5 seed mỗi biến thể; thêm biến thể `raw` giới hạn 202 ảnh; đánh giá trên test đã bỏ ảnh rò rỉ; duyệt nốt 38 ảnh còn cảnh báo (đưa lô về Release) rồi train lại `clean`.
 
 ## 6. Quyết định và ghi chú AI
 **(a) Quyết định cuối: Hold.** Không còn lỗi bắt buộc, nhưng 38/202 ảnh (18,8%) còn cảnh báo chưa duyệt. Để thành Release cần người duyệt thêm ít nhất ~18 ảnh trong số 38 ảnh còn cảnh báo (để xuống dưới 10% = 20 ảnh), ưu tiên `POSSIBLE_MISSING` (12 ảnh) và `POSSIBLE_FALSE_POS`; hoặc tăng ngân sách duyệt lên ~125 ảnh. Không hạ `conf` xuống chỉ để đạt Release (mục 3).
